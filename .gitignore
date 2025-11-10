@@ -12,3 +12,6 @@ wheels/
 *.mp4
 *.txt
 *.png
+
+.DS_Store
+AGENTS.md
