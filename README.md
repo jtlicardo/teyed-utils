@@ -3,7 +3,15 @@
 ## Setup
 
 1. Install [uv](https://github.com/astral-sh/uv)
-2. Run `uv sync`
+2. Clone the repository:
+   ```bash
+   git clone https://github.com/jtlicardo/teyed-utils.git
+   cd teyed-utils
+   ```
+3. Install dependencies:
+   ```bash
+   uv sync
+   ```
 
 ## Usage
 
