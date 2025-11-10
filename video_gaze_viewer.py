@@ -93,7 +93,7 @@ def main() -> None:
     text = ax_3d.text2D(0.05, 0.95, "", transform=ax_3d.transAxes)
 
     ax_xy = fig.add_subplot(gs[0, 2])
-    ax_xy.set_title("Gaze XY")
+    ax_xy.set_title("Gaze XY (y inverted)")
     ax_xy.set_xlabel("X")
     ax_xy.set_ylabel("Y")
     ax_xy.set_xlim(-1, 1)
