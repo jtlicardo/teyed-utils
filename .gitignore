@@ -13,5 +13,9 @@ wheels/
 *.txt
 *.png
 
+# Exception: keep example files
+!videos/DikablisT_26_13.mp4
+!annotations/DikablisT_26_13.mp4gaze_vec.txt
+
 .DS_Store
 AGENTS.md

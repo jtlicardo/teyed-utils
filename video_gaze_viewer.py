@@ -45,7 +45,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--video",
-        default="videos/DikablisR_1_1.mp4",
+        default="videos/DikablisT_26_13.mp4",
         help="Path to the input video file.",
     )
     parser.add_argument(
