@@ -4,4 +4,12 @@
 
 1. Install [uv](https://github.com/astral-sh/uv)
 2. Run `uv sync`
-3. Run scripts with `uv run <script.py> [args]`
+
+## Usage
+
+Run scripts with `uv run <script.py> [args]`
+
+Example:
+```bash
+uv run video_gaze_viewer.py
+```
