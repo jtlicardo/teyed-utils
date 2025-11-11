@@ -17,5 +17,9 @@ wheels/
 !videos/DikablisT_26_13.mp4
 !annotations/DikablisT_26_13.mp4gaze_vec.txt
 
+!splits/test.txt
+!splits/train.txt
+!splits/val.txt
+
 .DS_Store
 AGENTS.md
