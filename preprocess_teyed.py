@@ -63,7 +63,7 @@ def build_split_labels(
             header=0,
         )
         if frame_stride > 1:
-            df = df.iloc[::frame_stride]  # downsample labels
+            df = df.iloc[::frame_stride]  # select every n-th row
 
         n = min(saved, len(df))
         if n == 0:
@@ -96,7 +96,9 @@ def main(args):
     annotations_dir = root / "ANNOTATIONS"
 
     output_parent = Path(args.output_root)
-    params_name = f"{args.frame_width}x{args.frame_height}_stride{args.frame_stride}"
+    params_name = (
+        f"{args.frame_width}x{args.frame_height}_stride{args.frame_stride}_q{args.jpeg_q}"
+    )
     output_base = output_parent / params_name
     output_base.mkdir(parents=True, exist_ok=True)
     print(f"Saving preprocessed data to: {output_base}")
