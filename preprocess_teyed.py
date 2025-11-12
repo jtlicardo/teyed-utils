@@ -3,14 +3,18 @@ import os
 import random
 import shutil
 import subprocess
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
 
 
 def extract_video_ffmpeg(
-    video_path: Path, out_dir: Path, size: tuple, stride: int, q: int
+    video_path: Path,
+    out_dir: Path,
+    size: tuple,
+    stride: int,
+    q: int,
+    threads: int,
 ) -> int:
     """Extracts frames from a video using ffmpeg."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -23,18 +27,24 @@ def extract_video_ffmpeg(
         "error",
         "-err_detect",
         "ignore_err",
-        "-i",
-        str(video_path),
-        "-vf",
-        vf,
-        "-vsync",
-        "vfr",
-        "-q:v",
-        str(q),
-        "-start_number",
-        "1",
-        str(out_dir / "%06d.jpg"),
     ]
+    if threads and threads > 0:
+        cmd.extend(["-threads", str(threads)])
+    cmd.extend(
+        [
+            "-i",
+            str(video_path),
+            "-vf",
+            vf,
+            "-vsync",
+            "vfr",
+            "-q:v",
+            str(q),
+            "-start_number",
+            "1",
+            str(out_dir / "%06d.jpg"),
+        ]
+    )
     result = subprocess.run(
         cmd,
         check=False,
@@ -69,6 +79,7 @@ def stage_batch_files(batch_names, source_root: Path, stage_root: Path):
     videos_stage = stage_root / "VIDEOS"
     annotations_stage = stage_root / "ANNOTATIONS"
 
+    # Clear and recreate staging directories
     for directory in (videos_stage, annotations_stage):
         if directory.exists():
             shutil.rmtree(directory)
@@ -88,7 +99,7 @@ def stage_batch_files(batch_names, source_root: Path, stage_root: Path):
     return staged_names, videos_stage, annotations_stage
 
 
-def process_video_task(
+def process_video(
     name,
     videos_dir,
     annotations_dir,
@@ -97,6 +108,7 @@ def process_video_task(
     frame_height,
     frame_stride,
     jpeg_q,
+    ffmpeg_threads,
 ):
     """Processes a single video and returns metadata/rows."""
     videos_dir = Path(videos_dir)
@@ -123,6 +135,7 @@ def process_video_task(
             size=(frame_width, frame_height),
             stride=frame_stride,
             q=jpeg_q,
+            threads=ffmpeg_threads,
         )
 
         df = pd.read_csv(
@@ -171,7 +184,7 @@ def process_video_task(
         }
 
 
-def process_split_parallel(
+def process_split(
     split_name,
     video_list,
     videos_dir,
@@ -181,9 +194,9 @@ def process_split_parallel(
     frame_height,
     frame_stride,
     jpeg_q,
-    num_workers,
+    ffmpeg_threads,
 ):
-    """Runs per-video processing tasks in parallel for a given split."""
+    """Runs per-video processing sequentially for a given split."""
     if not video_list:
         print(f"No videos for split {split_name}, skipping.")
         return []
@@ -194,45 +207,34 @@ def process_split_parallel(
 
     print(
         f"Processing {len(video_list)} videos for split {split_name} "
-        f"using {num_workers} workers..."
+        f"with ffmpeg threads={ffmpeg_threads}..."
     )
 
-    task_args = [
-        (
+    for idx, name in enumerate(video_list, start=1):
+        result = process_video(
             name,
-            str(videos_dir),
-            str(annotations_dir),
-            str(out_root),
+            videos_dir,
+            annotations_dir,
+            out_root,
             frame_width,
             frame_height,
             frame_stride,
             jpeg_q,
+            ffmpeg_threads,
         )
-        for name in video_list
-    ]
-
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = [executor.submit(process_video_task, *args) for args in task_args]
-        for idx, future in enumerate(as_completed(futures), start=1):
-            result = future.result()
-            status = result["status"]
-            name = result["name"]
-            if status == "ok":
-                rows.extend(result["rows"])
-                print(
-                    f"  [{idx}/{len(video_list)}] {name}: "
-                    f"frames_saved={result['frames_saved']}, "
-                    f"labels_used={result['labels_used']}"
-                )
-            elif status == "missing":
-                print(f"  [{idx}/{len(video_list)}] Skip missing: {name}")
-            elif status == "empty":
-                print(f"  [{idx}/{len(video_list)}] No frames/labels for {name}")
-            else:
-                print(
-                    f"  [{idx}/{len(video_list)}] Error processing {name}: "
-                    f"{result['message']}"
-                )
+        status = result["status"]
+        if status == "ok":
+            rows.extend(result["rows"])
+            print(
+                f"  [{idx}/{len(video_list)}] {name}: "
+                f"frames_saved={result['frames_saved']}, labels_used={result['labels_used']}"
+            )
+        elif status == "missing":
+            print(f"  [{idx}/{len(video_list)}] Skip missing: {name}")
+        elif status == "empty":
+            print(f"  [{idx}/{len(video_list)}] No frames/labels for {name}")
+        else:
+            print(f"  [{idx}/{len(video_list)}] Error processing {name}: {result['message']}")
 
     if not rows:
         print(f"No rows generated for split {split_name}.")
@@ -299,14 +301,14 @@ def main(args):
         splits["val"] = random.sample(splits["val"], num_to_sample)
         print(f"Sampled {len(splits['val'])} videos for validation.")
 
-    num_workers = args.num_workers or os.cpu_count() or 1
+    ffmpeg_threads = args.num_workers or os.cpu_count() or 1
     # Process each split with optional staging batches
     for split_name, video_list in splits.items():
         out_root = output_base / split_name
         all_rows = []
 
         if stage_source_root:
-            batch_size = args.stage_batch_size or num_workers
+            batch_size = args.stage_batch_size or ffmpeg_threads
             for batch in chunked(video_list, batch_size):
                 print(
                     f"Staging batch of {len(batch)} videos for split {split_name}..."
@@ -316,7 +318,7 @@ def main(args):
                 )
                 if not staged_names:
                     continue
-                batch_rows = process_split_parallel(
+                batch_rows = process_split(
                     split_name,
                     staged_names,
                     staged_videos_dir,
@@ -326,11 +328,11 @@ def main(args):
                     frame_height=args.frame_height,
                     frame_stride=args.frame_stride,
                     jpeg_q=args.jpeg_q,
-                    num_workers=num_workers,
+                    ffmpeg_threads=ffmpeg_threads,
                 )
                 all_rows.extend(batch_rows)
         else:
-            all_rows = process_split_parallel(
+            all_rows = process_split(
                 split_name,
                 video_list,
                 videos_dir,
@@ -340,7 +342,7 @@ def main(args):
                 frame_height=args.frame_height,
                 frame_stride=args.frame_stride,
                 jpeg_q=args.jpeg_q,
-                num_workers=num_workers,
+                ffmpeg_threads=ffmpeg_threads,
             )
 
         if all_rows:
@@ -381,7 +383,7 @@ if __name__ == "__main__":
         default=0,
         help=(
             "Number of videos to stage per batch when --stage_source_root is used. "
-            "Defaults to --num_workers."
+            "Defaults to the value of --num_workers (threads)."
         ),
     )
     parser.add_argument(
@@ -419,7 +421,10 @@ if __name__ == "__main__":
         "--num_workers",
         type=int,
         default=os.cpu_count() or 2,
-        help="Number of parallel worker processes to use.",
+        help=(
+            "Number of CPU threads to hand to ffmpeg for each video. "
+            "Set 0 to let ffmpeg pick automatically."
+        ),
     )
 
     args = parser.parse_args()
