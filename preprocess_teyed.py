@@ -1,6 +1,9 @@
 import argparse
+import os
 import random
+import shutil
 import subprocess
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
@@ -18,6 +21,8 @@ def extract_video_ffmpeg(
         "-y",
         "-loglevel",
         "error",
+        "-err_detect",
+        "ignore_err",
         "-i",
         str(video_path),
         "-vf",
@@ -30,28 +35,83 @@ def extract_video_ffmpeg(
         "1",
         str(out_dir / "%06d.jpg"),
     ]
-    subprocess.run(cmd, check=True)
+    result = subprocess.run(
+        cmd,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(
+            f"    ffmpeg reported errors for {video_path.name} "
+            f"(return code {result.returncode}). Proceeding with any frames decoded "
+            "before the failure."
+        )
+        if result.stderr:
+            last_lines = [line for line in result.stderr.strip().splitlines() if line]
+            if last_lines:
+                print(f"    Last ffmpeg message: {last_lines[-1]}")
     return len(list(out_dir.glob("*.jpg")))
 
 
-def build_split_labels(
-    video_names, videos_dir, annotations_dir, out_root, frame_size, frame_stride, jpeg_q
-) -> Path:
-    """Processes a list of videos, extracts frames, and creates a labels.csv file."""
-    rows = []
-    print(f"Processing {len(video_names)} videos for split: {out_root.name}...")
+def stage_video_locally(video_path: Path, cache_dir: Path) -> Path:
+    """Copies the video to a local cache so ffmpeg reads from a reliable source."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cached_video = cache_dir / video_path.name
+    try:
+        src_size = video_path.stat().st_size
+    except FileNotFoundError:
+        return video_path
 
-    for i, name in enumerate(video_names):
-        vpath = videos_dir / name
-        apath = annotations_dir / f"{name}gaze_vec.txt"
-        if not (vpath.exists() and apath.exists()):
-            print(f"  [{i + 1}/{len(video_names)}] Skip missing: {name}")
-            continue
+    if cached_video.exists() and cached_video.stat().st_size == src_size:
+        return cached_video
 
-        stem = vpath.stem
-        out_dir = out_root / stem
+    if cached_video.exists():
+        cached_video.unlink()
+
+    print(f"  Caching {video_path.name} locally for stable decoding...")
+    shutil.copy2(video_path, cached_video)
+    return cached_video
+
+
+def process_video_task(
+    name,
+    videos_dir,
+    annotations_dir,
+    out_root,
+    frame_width,
+    frame_height,
+    frame_stride,
+    jpeg_q,
+    cache_dir,
+):
+    """Processes a single video and returns metadata/rows."""
+    videos_dir = Path(videos_dir)
+    annotations_dir = Path(annotations_dir)
+    out_root = Path(out_root)
+    cache_dir = Path(cache_dir) if cache_dir else None
+
+    vpath = videos_dir / name
+    apath = annotations_dir / f"{name}gaze_vec.txt"
+    if not (vpath.exists() and apath.exists()):
+        return {
+            "name": name,
+            "rows": [],
+            "frames_saved": 0,
+            "labels_used": 0,
+            "status": "missing",
+            "message": "missing video or annotation",
+        }
+
+    try:
+        out_dir = out_root / vpath.stem
+        src_video = stage_video_locally(vpath, cache_dir) if cache_dir else vpath
         saved = extract_video_ffmpeg(
-            vpath, out_dir, size=frame_size, stride=frame_stride, q=jpeg_q
+            src_video,
+            out_dir,
+            size=(frame_width, frame_height),
+            stride=frame_stride,
+            q=jpeg_q,
         )
 
         df = pd.read_csv(
@@ -67,21 +127,112 @@ def build_split_labels(
 
         n = min(saved, len(df))
         if n == 0:
-            print(f"  [{i + 1}/{len(video_names)}] No frames/labels for {stem}")
-            continue
+            return {
+                "name": name,
+                "rows": [],
+                "frames_saved": saved,
+                "labels_used": n,
+                "status": "empty",
+                "message": "no frames/labels after extraction",
+            }
 
         df = df.iloc[:n]
+        rows = [
+            (f"{vpath.stem}/{j:06d}.jpg", x, y)
+            for j, (x, y) in enumerate(zip(df["x"], df["y"]), start=1)
+        ]
+        return {
+            "name": name,
+            "rows": rows,
+            "frames_saved": saved,
+            "labels_used": n,
+            "status": "ok",
+            "message": "",
+        }
+    except Exception as exc:
+        return {
+            "name": name,
+            "rows": [],
+            "frames_saved": 0,
+            "labels_used": 0,
+            "status": "error",
+            "message": str(exc),
+        }
 
-        file_names = [f"{stem}/{j:06d}.jpg" for j in range(1, n + 1)]
-        rows.extend(zip(file_names, df["x"].to_numpy(), df["y"].to_numpy()))
-        print(
-            f"  [{i + 1}/{len(video_names)}] {stem}: frames_saved={saved}, labels_used={n}"
+
+def process_split_parallel(
+    split_name,
+    video_list,
+    videos_dir,
+    annotations_dir,
+    out_root,
+    frame_width,
+    frame_height,
+    frame_stride,
+    jpeg_q,
+    cache_dir,
+    num_workers,
+):
+    """Runs per-video processing tasks in parallel for a given split."""
+    if not video_list:
+        print(f"No videos for split {split_name}, skipping.")
+        return None
+
+    out_root = Path(out_root)
+    out_root.mkdir(parents=True, exist_ok=True)
+    rows = []
+
+    print(
+        f"Processing {len(video_list)} videos for split {split_name} "
+        f"using {num_workers} workers..."
+    )
+
+    task_args = [
+        (
+            name,
+            str(videos_dir),
+            str(annotations_dir),
+            str(out_root),
+            frame_width,
+            frame_height,
+            frame_stride,
+            jpeg_q,
+            str(cache_dir) if cache_dir else None,
         )
+        for name in video_list
+    ]
 
-    out_csv = out_root / "labels.csv"
-    pd.DataFrame(rows, columns=["filename", "x", "y"]).to_csv(out_csv, index=False)
-    print(f"Wrote {out_csv} with {len(rows)} rows\n")
-    return out_csv
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(process_video_task, *args) for args in task_args]
+        for idx, future in enumerate(as_completed(futures), start=1):
+            result = future.result()
+            status = result["status"]
+            name = result["name"]
+            if status == "ok":
+                rows.extend(result["rows"])
+                print(
+                    f"  [{idx}/{len(video_list)}] {name}: "
+                    f"frames_saved={result['frames_saved']}, "
+                    f"labels_used={result['labels_used']}"
+                )
+            elif status == "missing":
+                print(f"  [{idx}/{len(video_list)}] Skip missing: {name}")
+            elif status == "empty":
+                print(f"  [{idx}/{len(video_list)}] No frames/labels for {name}")
+            else:
+                print(
+                    f"  [{idx}/{len(video_list)}] Error processing {name}: "
+                    f"{result['message']}"
+                )
+
+    if rows:
+        out_csv = out_root / "labels.csv"
+        pd.DataFrame(rows, columns=["filename", "x", "y"]).to_csv(out_csv, index=False)
+        print(f"Wrote {out_csv} with {len(rows)} rows\n")
+        return out_csv
+
+    print(f"No rows generated for split {split_name}.")
+    return None
 
 
 def main(args):
@@ -96,12 +247,21 @@ def main(args):
     annotations_dir = root / "ANNOTATIONS"
 
     output_parent = Path(args.output_root)
+    cache_dir = Path(args.local_cache_dir).resolve() if args.local_cache_dir else None
+    sample_suffix = ""
+    if args.train_sample_frac < 1.0:
+        sample_suffix += f"_train{args.train_sample_frac:.2f}"
+    if args.val_sample_frac < 1.0:
+        sample_suffix += f"_val{args.val_sample_frac:.2f}"
     params_name = (
-        f"{args.frame_width}x{args.frame_height}_stride{args.frame_stride}_q{args.jpeg_q}"
+        f"{args.frame_width}x{args.frame_height}_stride{args.frame_stride}_q{args.jpeg_q}{sample_suffix}"
     )
     output_base = output_parent / params_name
     output_base.mkdir(parents=True, exist_ok=True)
     print(f"Saving preprocessed data to: {output_base}")
+    if cache_dir:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Using local cache directory: {cache_dir}")
 
     repo_dir = Path(args.splits_dir)
     split_files = {
@@ -125,19 +285,22 @@ def main(args):
         splits["val"] = random.sample(splits["val"], num_to_sample)
         print(f"Sampled {len(splits['val'])} videos for validation.")
 
-    # Process each split
-    frame_params = {
-        "frame_size": (args.frame_width, args.frame_height),
-        "frame_stride": args.frame_stride,
-        "jpeg_q": args.jpeg_q,
-    }
-
+    num_workers = args.num_workers or os.cpu_count() or 1
+    # Process each split in parallel
     for split_name, video_list in splits.items():
-        if not video_list:
-            continue
         out_root = output_base / split_name
-        build_split_labels(
-            video_list, videos_dir, annotations_dir, out_root, **frame_params
+        process_split_parallel(
+            split_name,
+            video_list,
+            videos_dir,
+            annotations_dir,
+            out_root,
+            frame_width=args.frame_width,
+            frame_height=args.frame_height,
+            frame_stride=args.frame_stride,
+            jpeg_q=args.jpeg_q,
+            cache_dir=cache_dir,
+            num_workers=num_workers,
         )
 
 
@@ -163,6 +326,15 @@ if __name__ == "__main__":
         required=True,
         help="Path to the directory with train/val/test.txt files",
     )
+    parser.add_argument(
+        "--local_cache_dir",
+        type=str,
+        default=None,
+        help=(
+            "Optional directory to cache videos locally before decoding. "
+            "Useful when raw data lives on slower or flaky network mounts."
+        ),
+    )
 
     parser.add_argument("--frame_width", type=int, default=160)
     parser.add_argument("--frame_height", type=int, default=160)
@@ -183,6 +355,12 @@ if __name__ == "__main__":
     )
 
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=os.cpu_count() or 2,
+        help="Number of parallel worker processes to use.",
+    )
 
     args = parser.parse_args()
     main(args)
