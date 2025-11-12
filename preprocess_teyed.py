@@ -3,6 +3,7 @@ import os
 import random
 import shutil
 import subprocess
+import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -54,24 +55,20 @@ def extract_video_ffmpeg(
     return len(list(out_dir.glob("*.jpg")))
 
 
-def stage_video_locally(video_path: Path, cache_dir: Path) -> Path:
-    """Copies the video to a local cache so ffmpeg reads from a reliable source."""
+def stage_video_locally(video_path: Path, cache_dir: Path | None) -> tuple[Path, bool]:
+    """Optionally copy the video to fast local storage.
+
+    Returns (path_to_use, delete_after_use_flag).
+    """
+    if cache_dir is None:
+        return video_path, False
+
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cached_video = cache_dir / video_path.name
-    try:
-        src_size = video_path.stat().st_size
-    except FileNotFoundError:
-        return video_path
-
-    if cached_video.exists() and cached_video.stat().st_size == src_size:
-        return cached_video
-
-    if cached_video.exists():
-        cached_video.unlink()
-
-    print(f"  Caching {video_path.name} locally for stable decoding...")
+    unique_name = f"{video_path.stem}_{uuid.uuid4().hex}{video_path.suffix}"
+    cached_video = cache_dir / unique_name
+    print(f"  Caching {video_path.name} locally (ephemeral copy)...")
     shutil.copy2(video_path, cached_video)
-    return cached_video
+    return cached_video, True
 
 
 def process_video_task(
@@ -103,9 +100,11 @@ def process_video_task(
             "message": "missing video or annotation",
         }
 
+    cleanup_cache = False
+    src_video = vpath
     try:
         out_dir = out_root / vpath.stem
-        src_video = stage_video_locally(vpath, cache_dir) if cache_dir else vpath
+        src_video, cleanup_cache = stage_video_locally(vpath, cache_dir)
         saved = extract_video_ffmpeg(
             src_video,
             out_dir,
@@ -158,6 +157,12 @@ def process_video_task(
             "status": "error",
             "message": str(exc),
         }
+    finally:
+        if cache_dir and cleanup_cache:
+            try:
+                Path(src_video).unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def process_split_parallel(
@@ -335,7 +340,6 @@ if __name__ == "__main__":
             "Useful when raw data lives on slower or flaky network mounts."
         ),
     )
-
     parser.add_argument("--frame_width", type=int, default=160)
     parser.add_argument("--frame_height", type=int, default=160)
     parser.add_argument("--frame_stride", type=int, default=5)
