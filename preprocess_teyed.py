@@ -1,7 +1,5 @@
 import argparse
-import os
 import random
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -14,7 +12,6 @@ def extract_video_ffmpeg(
     size: tuple,
     stride: int,
     q: int,
-    threads: int,
 ) -> int:
     """Extracts frames from a video using ffmpeg."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -28,8 +25,6 @@ def extract_video_ffmpeg(
         "-err_detect",
         "ignore_err",
     ]
-    if threads and threads > 0:
-        cmd.extend(["-threads", str(threads)])
     cmd.extend(
         [
             "-i",
@@ -64,41 +59,6 @@ def extract_video_ffmpeg(
     return len(list(out_dir.glob("*.jpg")))
 
 
-def chunked(items, size):
-    """Yield successive chunks from the list."""
-    if size <= 0:
-        size = 1
-    for i in range(0, len(items), size):
-        yield items[i : i + size]
-
-
-def stage_batch_files(batch_names, source_root: Path, stage_root: Path):
-    """Copy a batch of videos/annotations to a local staging directory."""
-    videos_src = source_root / "VIDEOS"
-    annotations_src = source_root / "ANNOTATIONS"
-    videos_stage = stage_root / "VIDEOS"
-    annotations_stage = stage_root / "ANNOTATIONS"
-
-    # Clear and recreate staging directories
-    for directory in (videos_stage, annotations_stage):
-        if directory.exists():
-            shutil.rmtree(directory)
-        directory.mkdir(parents=True, exist_ok=True)
-
-    staged_names = []
-    for name in batch_names:
-        video_src = videos_src / name
-        anno_src = annotations_src / f"{name}gaze_vec.txt"
-        if not (video_src.exists() and anno_src.exists()):
-            print(f"  Skip staging missing assets for {name}")
-            continue
-        shutil.copy2(video_src, videos_stage / name)
-        shutil.copy2(anno_src, annotations_stage / f"{name}gaze_vec.txt")
-        staged_names.append(name)
-
-    return staged_names, videos_stage, annotations_stage
-
-
 def process_video(
     name,
     videos_dir,
@@ -108,7 +68,6 @@ def process_video(
     frame_height,
     frame_stride,
     jpeg_q,
-    ffmpeg_threads,
 ):
     """Processes a single video and returns metadata/rows."""
     videos_dir = Path(videos_dir)
@@ -135,7 +94,6 @@ def process_video(
             size=(frame_width, frame_height),
             stride=frame_stride,
             q=jpeg_q,
-            threads=ffmpeg_threads,
         )
 
         df = pd.read_csv(
@@ -194,7 +152,6 @@ def process_split(
     frame_height,
     frame_stride,
     jpeg_q,
-    ffmpeg_threads,
 ):
     """Runs per-video processing sequentially for a given split."""
     if not video_list:
@@ -205,10 +162,7 @@ def process_split(
     out_root.mkdir(parents=True, exist_ok=True)
     rows = []
 
-    print(
-        f"Processing {len(video_list)} videos for split {split_name} "
-        f"with ffmpeg threads={ffmpeg_threads}..."
-    )
+    print(f"Processing {len(video_list)} videos for split {split_name}...")
 
     for idx, name in enumerate(video_list, start=1):
         result = process_video(
@@ -220,7 +174,6 @@ def process_split(
             frame_height,
             frame_stride,
             jpeg_q,
-            ffmpeg_threads,
         )
         status = result["status"]
         if status == "ok":
@@ -234,7 +187,9 @@ def process_split(
         elif status == "empty":
             print(f"  [{idx}/{len(video_list)}] No frames/labels for {name}")
         else:
-            print(f"  [{idx}/{len(video_list)}] Error processing {name}: {result['message']}")
+            print(
+                f"  [{idx}/{len(video_list)}] Error processing {name}: {result['message']}"
+            )
 
     if not rows:
         print(f"No rows generated for split {split_name}.")
@@ -247,21 +202,7 @@ def main(args):
 
     # Define paths
     data_root = Path(args.data_root)
-    stage_source_root = (
-        Path(args.stage_source_root) if args.stage_source_root else None
-    )
-    if stage_source_root:
-        if stage_source_root.resolve() == data_root.resolve():
-            raise ValueError(
-                "stage_source_root must differ from data_root when staging is enabled"
-            )
-        assert stage_source_root.exists(), f"Missing stage source root: {stage_source_root}"
-        data_root.mkdir(parents=True, exist_ok=True)
-        print(
-            f"Batch staging enabled. Copying subsets from {stage_source_root} into {data_root}"
-        )
-    else:
-        assert data_root.exists(), f"Missing raw data root: {data_root}"
+    assert data_root.exists(), f"Missing raw data root: {data_root}"
 
     videos_dir = data_root / "VIDEOS"
     annotations_dir = data_root / "ANNOTATIONS"
@@ -280,70 +221,46 @@ def main(args):
     print(f"Saving preprocessed data to: {output_base}")
 
     repo_dir = Path(args.splits_dir)
-    split_files = {
-        "train": repo_dir / "train.txt",
-        "val": repo_dir / "val.txt",
-        "test": repo_dir / "test.txt",
-    }
+    split_file_order = ["train", "val", "test"]
     splits = {}
-    for split, file_path in split_files.items():
+    for split in split_file_order:
+        file_path = repo_dir / f"{split}.txt"
+        if not file_path.exists():
+            print(f"Warning: missing split file {file_path}, skipping.")
+            continue
         with open(file_path) as f:
             splits[split] = [line.strip() for line in f if line.strip()]
 
-    # Sample splits if fractions are provided
-    if args.train_sample_frac < 1.0:
-        num_to_sample = max(1, int(len(splits["train"]) * args.train_sample_frac))
-        splits["train"] = random.sample(splits["train"], num_to_sample)
-        print(f"Sampled {len(splits['train'])} videos for training.")
+    sample_fracs = {
+        "train": args.train_sample_frac,
+        "val": args.val_sample_frac,
+        "test": args.test_sample_frac,
+    }
+    for split_name, videos in list(splits.items()):
+        frac = sample_fracs.get(split_name, 1.0)
+        if frac <= 0.0:
+            print(f"Skipping split {split_name} (sample fraction <= 0).")
+            splits.pop(split_name)
+            continue
+        if frac < 1.0:
+            num_to_sample = max(1, int(len(videos) * frac))
+            splits[split_name] = random.sample(videos, num_to_sample)
+            print(f"Sampled {len(splits[split_name])} videos for {split_name}.")
 
-    if args.val_sample_frac < 1.0:
-        num_to_sample = max(1, int(len(splits["val"]) * args.val_sample_frac))
-        splits["val"] = random.sample(splits["val"], num_to_sample)
-        print(f"Sampled {len(splits['val'])} videos for validation.")
-
-    ffmpeg_threads = args.num_workers or os.cpu_count() or 1
-    # Process each split with optional staging batches
+    # Process each split sequentially
     for split_name, video_list in splits.items():
         out_root = output_base / split_name
-        all_rows = []
-
-        if stage_source_root:
-            batch_size = args.stage_batch_size or ffmpeg_threads
-            for batch in chunked(video_list, batch_size):
-                print(
-                    f"Staging batch of {len(batch)} videos for split {split_name}..."
-                )
-                staged_names, staged_videos_dir, staged_annotations_dir = stage_batch_files(
-                    batch, stage_source_root, data_root
-                )
-                if not staged_names:
-                    continue
-                batch_rows = process_split(
-                    split_name,
-                    staged_names,
-                    staged_videos_dir,
-                    staged_annotations_dir,
-                    out_root,
-                    frame_width=args.frame_width,
-                    frame_height=args.frame_height,
-                    frame_stride=args.frame_stride,
-                    jpeg_q=args.jpeg_q,
-                    ffmpeg_threads=ffmpeg_threads,
-                )
-                all_rows.extend(batch_rows)
-        else:
-            all_rows = process_split(
-                split_name,
-                video_list,
-                videos_dir,
-                annotations_dir,
-                out_root,
-                frame_width=args.frame_width,
-                frame_height=args.frame_height,
-                frame_stride=args.frame_stride,
-                jpeg_q=args.jpeg_q,
-                ffmpeg_threads=ffmpeg_threads,
-            )
+        all_rows = process_split(
+            split_name,
+            video_list,
+            videos_dir,
+            annotations_dir,
+            out_root,
+            frame_width=args.frame_width,
+            frame_height=args.frame_height,
+            frame_stride=args.frame_stride,
+            jpeg_q=args.jpeg_q,
+        )
 
         if all_rows:
             out_root.mkdir(parents=True, exist_ok=True)
@@ -362,29 +279,7 @@ if __name__ == "__main__":
         "--data_root",
         type=str,
         required=True,
-        help=(
-            "Path to the raw TEyeD dataset (if staging disabled) or the local "
-            "staging directory (if --stage_source_root is set)."
-        ),
-    )
-    parser.add_argument(
-        "--stage_source_root",
-        type=str,
-        default=None,
-        help=(
-            "Optional path to the original dataset (e.g., Google Drive). When set, "
-            "videos are copied from here to --data_root in small batches before "
-            "processing."
-        ),
-    )
-    parser.add_argument(
-        "--stage_batch_size",
-        type=int,
-        default=0,
-        help=(
-            "Number of videos to stage per batch when --stage_source_root is used. "
-            "Defaults to the value of --num_workers (threads)."
-        ),
+        help="Path to the raw TEyeD dataset (e.g., TEyeD/Dikablis)",
     )
     parser.add_argument(
         "--output_root",
@@ -407,25 +302,22 @@ if __name__ == "__main__":
         "--train_sample_frac",
         type=float,
         default=1.0,
-        help="Fraction of training videos to sample (e.g., 0.05 for 5%)",
+        help="Fraction of training videos to sample (e.g., 0.05 for 5%%)",
     )
     parser.add_argument(
         "--val_sample_frac",
         type=float,
         default=1.0,
-        help="Fraction of validation videos to sample (e.g., 0.05 for 5%)",
+        help="Fraction of validation videos to sample (e.g., 0.05 for 5%%)",
+    )
+    parser.add_argument(
+        "--test_sample_frac",
+        type=float,
+        default=1.0,
+        help="Fraction of test videos to sample (set 0 to skip)",
     )
 
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        default=os.cpu_count() or 2,
-        help=(
-            "Number of CPU threads to hand to ffmpeg for each video. "
-            "Set 0 to let ffmpeg pick automatically."
-        ),
-    )
 
     args = parser.parse_args()
     main(args)
