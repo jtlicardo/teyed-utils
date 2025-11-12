@@ -104,6 +104,10 @@ def process_video(
             names=["frame", "x", "y"],
             header=0,
         )
+
+        # Filter out invalid gaze points (-1, -1)
+        df = df[(df["x"] != -1) & (df["y"] != -1)].copy()
+
         if frame_stride > 1:
             df = df.iloc[::frame_stride]  # select every n-th row
 
