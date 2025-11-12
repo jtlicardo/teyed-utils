@@ -255,9 +255,11 @@ def main(args):
     cache_dir = Path(args.local_cache_dir).resolve() if args.local_cache_dir else None
     sample_suffix = ""
     if args.train_sample_frac < 1.0:
-        sample_suffix += f"_train{args.train_sample_frac:.2f}"
+        train_pct = int(args.train_sample_frac * 100)
+        sample_suffix += f"_train{train_pct:02d}"
     if args.val_sample_frac < 1.0:
-        sample_suffix += f"_val{args.val_sample_frac:.2f}"
+        val_pct = int(args.val_sample_frac * 100)
+        sample_suffix += f"_val{val_pct:02d}"
     params_name = (
         f"{args.frame_width}x{args.frame_height}_stride{args.frame_stride}_q{args.jpeg_q}{sample_suffix}"
     )
