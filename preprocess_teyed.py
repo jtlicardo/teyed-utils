@@ -3,7 +3,6 @@ import os
 import random
 import shutil
 import subprocess
-import uuid
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -55,20 +54,38 @@ def extract_video_ffmpeg(
     return len(list(out_dir.glob("*.jpg")))
 
 
-def stage_video_locally(video_path: Path, cache_dir: Path | None) -> tuple[Path, bool]:
-    """Optionally copy the video to fast local storage.
+def chunked(items, size):
+    """Yield successive chunks from the list."""
+    if size <= 0:
+        size = 1
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
 
-    Returns (path_to_use, delete_after_use_flag).
-    """
-    if cache_dir is None:
-        return video_path, False
 
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    unique_name = f"{video_path.stem}_{uuid.uuid4().hex}{video_path.suffix}"
-    cached_video = cache_dir / unique_name
-    print(f"  Caching {video_path.name} locally (ephemeral copy)...")
-    shutil.copy2(video_path, cached_video)
-    return cached_video, True
+def stage_batch_files(batch_names, source_root: Path, stage_root: Path):
+    """Copy a batch of videos/annotations to a local staging directory."""
+    videos_src = source_root / "VIDEOS"
+    annotations_src = source_root / "ANNOTATIONS"
+    videos_stage = stage_root / "VIDEOS"
+    annotations_stage = stage_root / "ANNOTATIONS"
+
+    for directory in (videos_stage, annotations_stage):
+        if directory.exists():
+            shutil.rmtree(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+
+    staged_names = []
+    for name in batch_names:
+        video_src = videos_src / name
+        anno_src = annotations_src / f"{name}gaze_vec.txt"
+        if not (video_src.exists() and anno_src.exists()):
+            print(f"  Skip staging missing assets for {name}")
+            continue
+        shutil.copy2(video_src, videos_stage / name)
+        shutil.copy2(anno_src, annotations_stage / f"{name}gaze_vec.txt")
+        staged_names.append(name)
+
+    return staged_names, videos_stage, annotations_stage
 
 
 def process_video_task(
@@ -80,13 +97,11 @@ def process_video_task(
     frame_height,
     frame_stride,
     jpeg_q,
-    cache_dir,
 ):
     """Processes a single video and returns metadata/rows."""
     videos_dir = Path(videos_dir)
     annotations_dir = Path(annotations_dir)
     out_root = Path(out_root)
-    cache_dir = Path(cache_dir) if cache_dir else None
 
     vpath = videos_dir / name
     apath = annotations_dir / f"{name}gaze_vec.txt"
@@ -100,13 +115,10 @@ def process_video_task(
             "message": "missing video or annotation",
         }
 
-    cleanup_cache = False
-    src_video = vpath
     try:
         out_dir = out_root / vpath.stem
-        src_video, cleanup_cache = stage_video_locally(vpath, cache_dir)
         saved = extract_video_ffmpeg(
-            src_video,
+            vpath,
             out_dir,
             size=(frame_width, frame_height),
             stride=frame_stride,
@@ -157,12 +169,6 @@ def process_video_task(
             "status": "error",
             "message": str(exc),
         }
-    finally:
-        if cache_dir and cleanup_cache:
-            try:
-                Path(src_video).unlink(missing_ok=True)
-            except Exception:
-                pass
 
 
 def process_split_parallel(
@@ -175,13 +181,12 @@ def process_split_parallel(
     frame_height,
     frame_stride,
     jpeg_q,
-    cache_dir,
     num_workers,
 ):
     """Runs per-video processing tasks in parallel for a given split."""
     if not video_list:
         print(f"No videos for split {split_name}, skipping.")
-        return None
+        return []
 
     out_root = Path(out_root)
     out_root.mkdir(parents=True, exist_ok=True)
@@ -202,7 +207,6 @@ def process_split_parallel(
             frame_height,
             frame_stride,
             jpeg_q,
-            str(cache_dir) if cache_dir else None,
         )
         for name in video_list
     ]
@@ -230,14 +234,9 @@ def process_split_parallel(
                     f"{result['message']}"
                 )
 
-    if rows:
-        out_csv = out_root / "labels.csv"
-        pd.DataFrame(rows, columns=["filename", "x", "y"]).to_csv(out_csv, index=False)
-        print(f"Wrote {out_csv} with {len(rows)} rows\n")
-        return out_csv
-
-    print(f"No rows generated for split {split_name}.")
-    return None
+    if not rows:
+        print(f"No rows generated for split {split_name}.")
+    return rows
 
 
 def main(args):
@@ -245,14 +244,27 @@ def main(args):
     random.seed(args.seed)
 
     # Define paths
-    root = Path(args.data_root)
-    assert root.exists(), f"Missing raw data root: {root}"
+    data_root = Path(args.data_root)
+    stage_source_root = (
+        Path(args.stage_source_root) if args.stage_source_root else None
+    )
+    if stage_source_root:
+        if stage_source_root.resolve() == data_root.resolve():
+            raise ValueError(
+                "stage_source_root must differ from data_root when staging is enabled"
+            )
+        assert stage_source_root.exists(), f"Missing stage source root: {stage_source_root}"
+        data_root.mkdir(parents=True, exist_ok=True)
+        print(
+            f"Batch staging enabled. Copying subsets from {stage_source_root} into {data_root}"
+        )
+    else:
+        assert data_root.exists(), f"Missing raw data root: {data_root}"
 
-    videos_dir = root / "VIDEOS"
-    annotations_dir = root / "ANNOTATIONS"
+    videos_dir = data_root / "VIDEOS"
+    annotations_dir = data_root / "ANNOTATIONS"
 
     output_parent = Path(args.output_root)
-    cache_dir = Path(args.local_cache_dir).resolve() if args.local_cache_dir else None
     sample_suffix = ""
     if args.train_sample_frac < 1.0:
         train_pct = int(args.train_sample_frac * 100)
@@ -260,15 +272,10 @@ def main(args):
     if args.val_sample_frac < 1.0:
         val_pct = int(args.val_sample_frac * 100)
         sample_suffix += f"_val{val_pct:02d}"
-    params_name = (
-        f"{args.frame_width}x{args.frame_height}_stride{args.frame_stride}_q{args.jpeg_q}{sample_suffix}"
-    )
+    params_name = f"{args.frame_width}x{args.frame_height}_stride{args.frame_stride}_q{args.jpeg_q}{sample_suffix}"
     output_base = output_parent / params_name
     output_base.mkdir(parents=True, exist_ok=True)
     print(f"Saving preprocessed data to: {output_base}")
-    if cache_dir:
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        print(f"Using local cache directory: {cache_dir}")
 
     repo_dir = Path(args.splits_dir)
     split_files = {
@@ -293,22 +300,56 @@ def main(args):
         print(f"Sampled {len(splits['val'])} videos for validation.")
 
     num_workers = args.num_workers or os.cpu_count() or 1
-    # Process each split in parallel
+    # Process each split with optional staging batches
     for split_name, video_list in splits.items():
         out_root = output_base / split_name
-        process_split_parallel(
-            split_name,
-            video_list,
-            videos_dir,
-            annotations_dir,
-            out_root,
-            frame_width=args.frame_width,
-            frame_height=args.frame_height,
-            frame_stride=args.frame_stride,
-            jpeg_q=args.jpeg_q,
-            cache_dir=cache_dir,
-            num_workers=num_workers,
-        )
+        all_rows = []
+
+        if stage_source_root:
+            batch_size = args.stage_batch_size or num_workers
+            for batch in chunked(video_list, batch_size):
+                print(
+                    f"Staging batch of {len(batch)} videos for split {split_name}..."
+                )
+                staged_names, staged_videos_dir, staged_annotations_dir = stage_batch_files(
+                    batch, stage_source_root, data_root
+                )
+                if not staged_names:
+                    continue
+                batch_rows = process_split_parallel(
+                    split_name,
+                    staged_names,
+                    staged_videos_dir,
+                    staged_annotations_dir,
+                    out_root,
+                    frame_width=args.frame_width,
+                    frame_height=args.frame_height,
+                    frame_stride=args.frame_stride,
+                    jpeg_q=args.jpeg_q,
+                    num_workers=num_workers,
+                )
+                all_rows.extend(batch_rows)
+        else:
+            all_rows = process_split_parallel(
+                split_name,
+                video_list,
+                videos_dir,
+                annotations_dir,
+                out_root,
+                frame_width=args.frame_width,
+                frame_height=args.frame_height,
+                frame_stride=args.frame_stride,
+                jpeg_q=args.jpeg_q,
+                num_workers=num_workers,
+            )
+
+        if all_rows:
+            out_root.mkdir(parents=True, exist_ok=True)
+            out_csv = out_root / "labels.csv"
+            pd.DataFrame(all_rows, columns=["filename", "x", "y"]).to_csv(
+                out_csv, index=False
+            )
+            print(f"Wrote {out_csv} with {len(all_rows)} rows\n")
 
 
 if __name__ == "__main__":
@@ -319,7 +360,29 @@ if __name__ == "__main__":
         "--data_root",
         type=str,
         required=True,
-        help="Path to the raw TEyeD dataset (e.g., .../Dikablis)",
+        help=(
+            "Path to the raw TEyeD dataset (if staging disabled) or the local "
+            "staging directory (if --stage_source_root is set)."
+        ),
+    )
+    parser.add_argument(
+        "--stage_source_root",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to the original dataset (e.g., Google Drive). When set, "
+            "videos are copied from here to --data_root in small batches before "
+            "processing."
+        ),
+    )
+    parser.add_argument(
+        "--stage_batch_size",
+        type=int,
+        default=0,
+        help=(
+            "Number of videos to stage per batch when --stage_source_root is used. "
+            "Defaults to --num_workers."
+        ),
     )
     parser.add_argument(
         "--output_root",
@@ -332,15 +395,6 @@ if __name__ == "__main__":
         type=str,
         required=True,
         help="Path to the directory with train/val/test.txt files",
-    )
-    parser.add_argument(
-        "--local_cache_dir",
-        type=str,
-        default=None,
-        help=(
-            "Optional directory to cache videos locally before decoding. "
-            "Useful when raw data lives on slower or flaky network mounts."
-        ),
     )
     parser.add_argument("--frame_width", type=int, default=160)
     parser.add_argument("--frame_height", type=int, default=160)
