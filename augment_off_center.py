@@ -3,8 +3,8 @@ Offline oversampling and augmentation for TEyeD gaze labels.
 
 Given a preprocessed dataset (e.g., TEyeD_preprocessed/.../train),
 this script copies the original images/labels to a new folder and
-adds augmented copies of off-center gaze samples so training on
-Colab does not need on-the-fly augmentation.
+adds augmented copies of off-center gaze samples so training does
+not need on-the-fly augmentation.
 """
 
 import argparse
