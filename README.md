@@ -22,7 +22,7 @@ Example:
 uv run video_gaze_viewer.py
 ```
 
-### Local preprocessing workflow
+### Local preprocessing workflow (example)
 
 ```bash
 uv run preprocess_teyed.py \
