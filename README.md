@@ -31,5 +31,10 @@ uv run preprocess_teyed.py \
     --splits_dir="splits" \
     --frame_width=128 --frame_height=128 \
     --frame_stride=5 --jpeg_q=4 \
-    --train_sample_frac=0.05 --val_sample_frac=0.05 --test_sample_frac=0.05
+    --train_sample_frac=0.10 --val_sample_frac=0.00 --test_sample_frac=0.00
+
+uv run augment_off_center.py \
+    --input_root="TEyeD_preprocessed/96x96_stride5_q4_train10" \
+    --output_root="TEyeD_preprocessed/96x96_stride5_q4_train10_aug" \
+    --splits train --radius_threshold=0.2 --oversample_factor=3 --jpeg_quality=95
 ```
