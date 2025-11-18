@@ -29,8 +29,8 @@ uv run preprocess_teyed.py \
     --data_root="TEyeD/Dikablis" \
     --output_root="TEyeD_preprocessed" \
     --splits_dir="splits" \
-    --frame_width=128 --frame_height=128 \
-    --frame_stride=5 --jpeg_q=4 \
+    --frame_width=96 --frame_height=96 \
+    --frame_stride=1 --jpeg_q=4 \
     --train_sample_frac=0.10 --val_sample_frac=0.00 --test_sample_frac=0.00
 
 uv run augment_off_center.py \
