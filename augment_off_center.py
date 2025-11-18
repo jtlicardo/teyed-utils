@@ -18,6 +18,17 @@ import numpy as np
 import pandas as pd
 
 
+def off_center_info(df: pd.DataFrame, radius_threshold: float) -> tuple[np.ndarray, int, int, float]:
+    """Return off-center mask, count, total, and percentage."""
+    coords = df[["x", "y"]].to_numpy()
+    radius = np.linalg.norm(coords, axis=1)
+    off_center_mask = radius > radius_threshold
+    off_cnt = int(off_center_mask.sum())
+    total = len(df)
+    pct = (off_cnt / total) * 100 if total else 0.0
+    return off_center_mask, off_cnt, total, pct
+
+
 def photometric_augment(image: np.ndarray) -> np.ndarray:
     """Apply light, label-safe augmentations to an image."""
     img = image.astype(np.float32)
@@ -27,6 +38,10 @@ def photometric_augment(image: np.ndarray) -> np.ndarray:
         beta = random.uniform(-12, 12)  # brightness shift in pixel domain
         img = img * alpha + beta
 
+    if random.random() < 0.6:
+        gamma = random.uniform(0.85, 1.2)
+        img = 255.0 * np.power(np.clip(img / 255.0, 0.0, 1.0), gamma)
+
     if random.random() < 0.4:
         sigma = random.uniform(2.0, 6.0)
         noise = np.random.normal(0.0, sigma, img.shape)
@@ -35,6 +50,17 @@ def photometric_augment(image: np.ndarray) -> np.ndarray:
     if random.random() < 0.3:
         ksize = random.choice([3, 5])
         img = cv2.GaussianBlur(img, (ksize, ksize), 0)
+
+    if random.random() < 0.6:
+        delta = random.uniform(-0.1, 0.1)
+        # BGR temperature shift: increase red, decrease blue (or vice versa).
+        gains = np.array([1.0 - delta, 1.0, 1.0 + delta], dtype=np.float32)
+        img = img * gains
+
+    if random.random() < 0.4:
+        amount = random.uniform(0.2, 0.45)
+        blurred = cv2.GaussianBlur(img, (0, 0), sigmaX=1.0)
+        img = cv2.addWeighted(img, 1.0 + amount, blurred, -amount, 0.0)
 
     img = np.clip(img, 0, 255)
     return img.astype(np.uint8)
@@ -121,14 +147,8 @@ def oversample_split(
     if max_rows is not None:
         df = df.head(max_rows).copy()
 
-    coords = df[["x", "y"]].to_numpy()
-    radius = np.linalg.norm(coords, axis=1)
-    off_center_mask = radius > radius_threshold
+    off_center_mask, off_cnt, total_before, pct_before = off_center_info(df, radius_threshold)
     off_center_idx = np.where(off_center_mask)[0].tolist()
-
-    off_cnt = int(off_center_mask.sum())
-    total_before = len(df)
-    pct_before = (off_cnt / total_before) * 100 if total_before else 0
     print(
         f"[{split_name}] Before oversampling: total={total_before}, "
         f"off_center={off_cnt} ({pct_before:.2f}%)"
@@ -178,40 +198,82 @@ def copy_split_only(split_name: str, split_dir: Path, out_dir: Path, max_rows: i
     print(f"[{split_name}] Copied split without augmentation. images={copied}, rows={len(df)}\n")
 
 
+def count_split_only(
+    split_name: str, split_dir: Path, radius_threshold: float, max_rows: int | None
+) -> None:
+    labels_path = split_dir / "labels.csv"
+    if not labels_path.exists():
+        print(f"Skipping {split_name}: missing {labels_path}")
+        return
+
+    df = pd.read_csv(labels_path)
+    if max_rows is not None:
+        df = df.head(max_rows).copy()
+
+    _, off_cnt, total, pct = off_center_info(df, radius_threshold)
+    print(f"[{split_name}] total={total}, off_center={off_cnt} ({pct:.2f}%)\n")
+
+
 def main(args: argparse.Namespace) -> None:
     random.seed(args.seed)
     np.random.seed(args.seed)
 
     input_root = Path(args.input_root)
-    output_root = Path(args.output_root)
-    output_root.mkdir(parents=True, exist_ok=True)
+    output_root = Path(args.output_root) if args.output_root else None
 
-    available_splits = [
-        p for p in input_root.iterdir() if p.is_dir() and (p / "labels.csv").exists()
-    ]
+    available_splits = []
+    if (input_root / "labels.csv").exists():
+        available_splits.append(input_root)
+    available_splits.extend(
+        [p for p in input_root.iterdir() if p.is_dir() and (p / "labels.csv").exists()]
+    )
     if not available_splits:
         raise SystemExit(f"No split folders with labels.csv found under {input_root}")
 
-    requested = set(args.splits)
+    requested = set(args.splits) if args.splits else set()
+    available_names = {p.name for p in available_splits}
+    missing = requested - available_names
+    if missing:
+        print(f"Warning: requested splits not found: {sorted(missing)}\n")
+
+    if args.count_only:
+        print(f"Counting off-center samples under {input_root}\n")
+        for split_dir in available_splits:
+            split_name = split_dir.name
+            if requested and split_name not in requested:
+                continue
+            count_split_only(
+                split_name,
+                split_dir,
+                radius_threshold=args.radius_threshold,
+                max_rows=args.max_rows,
+            )
+        return
+
+    if output_root is None:
+        raise SystemExit("--output_root is required unless --count_only is set")
+
+    output_root.mkdir(parents=True, exist_ok=True)
     print(f"Processing splits under {input_root} -> {output_root}")
-    print(f"Augmenting: {sorted(requested)} (others will be copied only)\n")
+    print(f"Augmenting: {sorted(requested) if requested else '[]'} (others will be copied only)\n")
 
     for split_dir in available_splits:
         split_name = split_dir.name
+        if requested and split_name not in requested:
+            copy_split_only(split_name, split_dir, output_root / split_name, max_rows=args.max_rows)
+            continue
+
         out_dir = output_root / split_name
-        if split_name in requested:
-            oversample_split(
-                split_name,
-                split_dir,
-                out_dir,
-                radius_threshold=args.radius_threshold,
-                oversample_factor=args.oversample_factor,
-                seed=args.seed,
-                jpeg_quality=args.jpeg_quality,
-                max_rows=args.max_rows,
-            )
-        else:
-            copy_split_only(split_name, split_dir, out_dir, max_rows=args.max_rows)
+        oversample_split(
+            split_name,
+            split_dir,
+            out_dir,
+            radius_threshold=args.radius_threshold,
+            oversample_factor=args.oversample_factor,
+            seed=args.seed,
+            jpeg_quality=args.jpeg_quality,
+            max_rows=args.max_rows,
+        )
 
 
 if __name__ == "__main__":
@@ -227,8 +289,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_root",
         type=str,
-        required=True,
-        help="Where to write the copied + augmented dataset.",
+        required=False,
+        default=None,
+        help="Where to write the copied + augmented dataset (required unless --count_only).",
     )
     parser.add_argument(
         "--splits",
@@ -249,6 +312,11 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="Optional limit per split for quick tests/trials.",
+    )
+    parser.add_argument(
+        "--count_only",
+        action="store_true",
+        help="Only report how many off-center labels are present per split; no files are written.",
     )
     parser.add_argument("--seed", type=int, default=42)
 
