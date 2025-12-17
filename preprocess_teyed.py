@@ -105,33 +105,48 @@ def process_video(
             header=0,
         )
 
+        # Keep annotations aligned with ffmpeg extraction.
+        # We must stride by *frame number* (not row index) and derive img_index explicitly;
+        # otherwise filtering rows (e.g. invalid gaze) shifts labels onto wrong images.
+        if frame_stride > 1:
+            df = df[(df["frame"] - 1) % frame_stride == 0].copy()
+        else:
+            df = df.copy()
+
+        # Map annotation frame -> extracted image index:
+        # frame=1 -> 000001.jpg, frame=1+stride -> 000002.jpg, ...
+        df["img_index"] = ((df["frame"] - 1) // frame_stride) + 1
+
+        # Keep only frames we successfully extracted
+        df = df[df["img_index"] <= saved].copy()
+
         # Filter out invalid gaze points (-1, -1)
         df = df[(df["x"] != -1) & (df["y"] != -1)].copy()
 
-        if frame_stride > 1:
-            df = df.iloc[::frame_stride]  # select every n-th row
-
-        n = min(saved, len(df))
-        if n == 0:
+        if df.empty:
             return {
                 "name": name,
                 "rows": [],
                 "frames_saved": saved,
-                "labels_used": n,
+                "labels_used": 0,
                 "status": "empty",
                 "message": "no frames/labels after extraction",
             }
 
-        df = df.iloc[:n]
-        rows = [
-            (f"{vpath.stem}/{j:06d}.jpg", x, y)
-            for j, (x, y) in enumerate(zip(df["x"], df["y"]), start=1)
-        ]
+        rows = []
+        for frame, img_index, x, y in df[["frame", "img_index", "x", "y"]].itertuples(
+            index=False, name=None
+        ):
+            rel = f"{vpath.stem}/{int(img_index):06d}.jpg"
+            if not (out_dir / f"{int(img_index):06d}.jpg").exists():
+                continue
+            rows.append((rel, float(x), float(y)))
+
         return {
             "name": name,
             "rows": rows,
             "frames_saved": saved,
-            "labels_used": n,
+            "labels_used": len(rows),
             "status": "ok",
             "message": "",
         }
