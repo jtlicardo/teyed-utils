@@ -30,9 +30,8 @@ uv run preprocess_teyed.py \
     --output_root="TEyeD_preprocessed" \
     --splits_dir="splits" \
     --frame_width=96 --frame_height=96 \
-    --frame_stride=5 --jpeg_q=4 \
+    --frame_stride=10 --jpeg_q=4 \
     --train_sample_frac=0.10 --val_sample_frac=0.00 --test_sample_frac=0.00
-
 ```
 
 Sanity check (example) - checking whether original and preprocessed labels match:
