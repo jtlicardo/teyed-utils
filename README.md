@@ -33,10 +33,6 @@ uv run preprocess_teyed.py \
     --frame_stride=5 --jpeg_q=4 \
     --train_sample_frac=0.10 --val_sample_frac=0.00 --test_sample_frac=0.00
 
-uv run augment_off_center.py \
-    --input_root="TEyeD_preprocessed/96x96_stride5_q4_train10" \
-    --output_root="TEyeD_preprocessed/96x96_stride5_q4_train10_aug" \
-    --splits train --radius_threshold=0.3 --oversample_factor=10 --jpeg_quality=95
 ```
 
 Sanity check (example) - checking whether original and preprocessed labels match:
