@@ -27,7 +27,9 @@ def prepare_frame(
     frame_bgr: np.ndarray,
     input_size: int,
 ) -> np.ndarray:
-    resized = cv2.resize(frame_bgr, (input_size, input_size), interpolation=cv2.INTER_AREA)
+    resized = cv2.resize(
+        frame_bgr, (input_size, input_size), interpolation=cv2.INTER_AREA
+    )
     resized = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
 
     arr = resized.astype(np.float32) / 255.0
@@ -119,7 +121,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video", required=True, help="Path to the input video.")
     parser.add_argument(
         "--model",
-        default="trained_models/eye_tracking_model_v2.keras",
+        default="trained_models/best_overall_v4.keras",
         help="Path to the trained Keras model.",
     )
     parser.add_argument(
@@ -157,6 +159,7 @@ def main() -> None:
     args = parse_args()
 
     model_path = Path(args.model)
+    print("Loading model:", model_path)
     if not model_path.exists():
         raise FileNotFoundError(f"Model not found: {model_path}")
 
