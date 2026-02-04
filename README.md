@@ -31,12 +31,22 @@ uv run preprocess_teyed.py \
     --splits_dir="splits" \
     --frame_width=96 --frame_height=96 \
     --frame_stride=10 --jpeg_q=4 \
-    --train_sample_frac=0.10 --val_sample_frac=0.00 --test_sample_frac=0.00
+    --train_sample_frac=1.00 --val_sample_frac=0.00 --test_sample_frac=0.00 \
+    --segmentation --seg_part pupil --seg_dimension 2D --seg_binarize
 ```
 
 Sanity check (example) - checking whether original and preprocessed labels match:
 
 ```
 uv run preprocessed_image_viewer.py --split-dir TEyeD_preprocessed/96x96_stride5_q4_train10/train --label-source both
+
 uv run preprocessed_image_viewer.py --split-dir TEyeD_preprocessed/96x96_stride5_q4_val50/val --label-source both
+```
+
+Segmentation labels sanity check
+```
+uv run preprocessed_image_viewer_seg.py \
+  --split-dir TEyeD_preprocessed/96x96_stride10_q4_train_full_seg_pupil_2D/train \
+  --seg_part pupil \
+  --seg_dimension 2D
 ```
