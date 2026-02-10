@@ -5,7 +5,40 @@ import matplotlib
 import pandas as pd
 
 
-def load_masks(split_dir: Path, part: str, dimension: str) -> pd.DataFrame:
+SEG_PART_CHOICES = ("pupil", "iris", "lid")
+SEG_PART_CMAPS = {
+    "pupil": "Reds",
+    "iris": "Greens",
+    "lid": "Blues",
+}
+
+
+def resolve_seg_parts(seg_parts: str) -> tuple[str, ...]:
+    raw = seg_parts.strip().lower()
+    if raw == "all":
+        return SEG_PART_CHOICES
+
+    parts = []
+    for token in seg_parts.split(","):
+        part = token.strip().lower()
+        if not part:
+            continue
+        if part not in SEG_PART_CHOICES:
+            raise ValueError(
+                f"Invalid segmentation part '{part}'. Choose from {SEG_PART_CHOICES}."
+            )
+        if part not in parts:
+            parts.append(part)
+
+    if not parts:
+        raise ValueError(
+            "No valid segmentation parts were provided. "
+            "Use --seg_parts pupil,iris,lid or --seg_parts all."
+        )
+    return tuple(parts)
+
+
+def load_masks(split_dir: Path, parts: tuple[str, ...], dimension: str) -> pd.DataFrame:
     """Load labels.csv and attach absolute image + mask paths."""
     labels_path = split_dir / "labels.csv"
     if not labels_path.exists():
@@ -17,19 +50,21 @@ def load_masks(split_dir: Path, part: str, dimension: str) -> pd.DataFrame:
     if "filename" not in df.columns:
         raise ValueError("labels.csv must have a filename column")
 
-    seg_root = split_dir / f"seg_{part}_{dimension}"
-    if not seg_root.exists():
-        raise FileNotFoundError(
-            f"{seg_root} not found. Run preprocess_teyed.py with --segmentation or "
-            "point --split-dir at a split containing segmentation masks."
-        )
-
-    def mask_path(name: str) -> Path:
-        rel = Path(name).with_suffix(".png")
-        return seg_root / rel
-
     df["image_path"] = df["filename"].apply(lambda name: split_dir / name)
-    df["mask_path"] = df["filename"].apply(mask_path)
+    for part in parts:
+        seg_root = split_dir / f"seg_{part}_{dimension}"
+        if not seg_root.exists():
+            raise FileNotFoundError(
+                f"{seg_root} not found. Run preprocess_teyed.py with --segmentation "
+                "or point --split-dir at a split containing those masks."
+            )
+
+        def mask_path(name: str, root: Path = seg_root) -> Path:
+            rel = Path(name).with_suffix(".png")
+            return root / rel
+
+        df[f"mask_path_{part}"] = df["filename"].apply(mask_path)
+
     missing_images = df[~df["image_path"].apply(Path.exists)]
     if not missing_images.empty:
         print(
@@ -37,13 +72,16 @@ def load_masks(split_dir: Path, part: str, dimension: str) -> pd.DataFrame:
             "They will be skipped."
         )
         df = df[df["image_path"].apply(Path.exists)]
-    missing_masks = df[~df["mask_path"].apply(Path.exists)]
-    if not missing_masks.empty:
-        print(
-            f"Warning: {len(missing_masks)} rows reference missing masks. "
-            "They will be skipped."
-        )
-        df = df[df["mask_path"].apply(Path.exists)]
+
+    for part in parts:
+        col = f"mask_path_{part}"
+        missing_masks = df[~df[col].apply(Path.exists)]
+        if not missing_masks.empty:
+            print(
+                f"Warning: {len(missing_masks)} rows reference missing {part} masks. "
+                "They will be skipped."
+            )
+            df = df[df[col].apply(Path.exists)]
 
     if df.empty:
         raise RuntimeError("No masks found after filtering missing files.")
@@ -56,15 +94,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--split-dir",
-        default="TEyeD_preprocessed/96x96_stride5_q4_train01_seg_pupil_2D/train",
+        default="TEyeD_preprocessed/96x96_stride5_q4_train01_seg_pupil-iris-lid_2D/train",
         type=Path,
         help="Folder containing labels.csv and seg_* folders (e.g., TEyeD_preprocessed/.../train).",
     )
     parser.add_argument(
-        "--seg_part",
-        choices=["pupil", "iris", "lid"],
-        default="pupil",
-        help="Which segmentation part to display.",
+        "--seg_parts",
+        type=str,
+        default="pupil,iris,lid",
+        help=(
+            "Comma-separated parts to display together "
+            "(e.g., pupil,iris,lid) or 'all'."
+        ),
     )
     parser.add_argument(
         "--seg_dimension",
@@ -134,7 +175,8 @@ def main() -> None:
     import matplotlib.pyplot as plt
 
     args = parse_args()
-    df = load_masks(args.split_dir, args.seg_part, args.seg_dimension)
+    parts = resolve_seg_parts(args.seg_parts)
+    df = load_masks(args.split_dir, parts, args.seg_dimension)
 
     if args.shuffle:
         df = df.sample(frac=1, random_state=args.seed).reset_index(drop=True)
@@ -161,34 +203,49 @@ def main() -> None:
         if img.ndim == 3 and img.shape[2] == 4:
             img = img[:, :, :3]
 
-        mask = plt.imread(row["mask_path"])
-        mask = normalize_mask(mask)
+        masks = {}
+        for part in parts:
+            mask = plt.imread(row[f"mask_path_{part}"])
+            masks[part] = normalize_mask(mask)
 
         ax.imshow(img, cmap="gray" if img.ndim == 2 else None, origin="upper")
         if args.overlay:
             alpha = max(0.0, min(1.0, args.mask_alpha))
-            ax.imshow(
-                mask,
-                cmap="autumn",
-                origin="upper",
-                vmin=0.0,
-                vmax=1.0,
-                alpha=mask * alpha,
-            )
+            # Draw pupil last so it stays visually on top of other masks.
+            overlay_parts = [part for part in parts if part != "pupil"]
+            if "pupil" in parts:
+                overlay_parts.append("pupil")
+
+            for part in overlay_parts:
+                mask = masks[part]
+                ax.imshow(
+                    mask,
+                    cmap=SEG_PART_CMAPS.get(part, "autumn"),
+                    origin="upper",
+                    vmin=0.0,
+                    vmax=1.0,
+                    alpha=mask * alpha,
+                )
 
         ax.set_title(f"{idx + 1}/{len(records)} — {row['filename']}")
         ax.set_xlabel("X (pixels)")
         ax.set_ylabel("Y (pixels)")
         ax.set_aspect("equal")
 
-        white_ratio = float(mask.mean()) if mask.size else 0.0
+        part_lines = []
+        for part in parts:
+            mask = masks[part]
+            white_ratio = float(mask.mean()) if mask.size else 0.0
+            part_lines.append(f"{part:>5} ({SEG_PART_CMAPS.get(part, 'n/a')}): {white_ratio:.4f}")
+
         ax.text(
             5,
             20,
-            f"mask: {row['mask_path'].name}\n"
+            f"parts: {','.join(parts)}\n"
             f"binarize: {'on' if args.binarize else 'off'}\n"
             f"overlay: {'on' if args.overlay else 'off'} (alpha={args.mask_alpha:.2f})\n"
-            f"white_ratio: {white_ratio:.4f}",
+            + "white_ratio:\n"
+            + "\n".join(part_lines),
             color="white",
             fontsize=9,
             fontweight="bold",

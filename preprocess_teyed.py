@@ -7,6 +7,9 @@ from pathlib import Path
 import pandas as pd
 
 
+SEG_PART_CHOICES = ("pupil", "iris", "lid")
+
+
 def extract_video_ffmpeg(
     video_path: Path,
     out_dir: Path,
@@ -162,6 +165,33 @@ def valid_image_indices(validity_path: Path, stride: int) -> set[int]:
     return keep
 
 
+def resolve_seg_parts(seg_parts: str) -> tuple[str, ...]:
+    """Resolve segmentation part selection from CLI arg."""
+    raw = seg_parts.strip().lower()
+    if raw == "all":
+        return SEG_PART_CHOICES
+
+    parts = []
+    for token in seg_parts.split(","):
+        part = token.strip().lower()
+        if not part:
+            continue
+        if part not in SEG_PART_CHOICES:
+            raise ValueError(
+                f"Invalid segmentation part '{part}'. Choose from {SEG_PART_CHOICES}."
+            )
+        if part not in parts:
+            parts.append(part)
+
+    if not parts:
+        raise ValueError(
+            "No valid segmentation parts were provided. "
+            "Use --seg_parts pupil,iris,lid or --seg_parts all."
+        )
+
+    return tuple(parts)
+
+
 def process_video(
     name,
     videos_dir,
@@ -172,7 +202,7 @@ def process_video(
     frame_stride,
     jpeg_q,
     segmentation,
-    seg_part,
+    seg_parts,
     seg_dimension,
     seg_binarize,
     seg_threshold,
@@ -233,45 +263,67 @@ def process_video(
         df = df[(df["x"] != -1) & (df["y"] != -1)].copy()
 
         if segmentation and seg_use_validity:
-            validity_path = annotations_dir / f"{name}validity_{seg_part}.txt"
-            if validity_path.exists():
-                keep_valid = valid_image_indices(validity_path, frame_stride)
+            keep_valid = None
+            for seg_part in seg_parts:
+                validity_path = annotations_dir / f"{name}validity_{seg_part}.txt"
+                if not validity_path.exists():
+                    print(f"    validity file missing: {validity_path.name}")
+                    continue
+                part_valid = valid_image_indices(validity_path, frame_stride)
+                if keep_valid is None:
+                    keep_valid = part_valid
+                else:
+                    keep_valid &= part_valid
+            if keep_valid is not None:
                 df = df[df["img_index"].isin(keep_valid)].copy()
-            else:
-                print(f"    validity file missing: {validity_path.name}")
 
-        seg_dir = None
         if segmentation:
-            seg_path = annotations_dir / f"{name}{seg_part}_seg_{seg_dimension}.mp4"
-            if not seg_path.exists():
-                return {
-                    "name": name,
-                    "rows": [],
-                    "frames_saved": saved,
-                    "labels_used": 0,
-                    "status": "missing_seg",
-                    "message": "missing segmentation video",
-                }
-            seg_root = out_root / f"seg_{seg_part}_{seg_dimension}"
-            seg_dir = seg_root / vpath.stem
-            extract_segmentation_ffmpeg(
-                seg_path,
-                seg_dir,
-                size=(frame_width, frame_height),
-                stride=frame_stride,
-                binarize=seg_binarize,
-                threshold=seg_threshold,
-            )
-            mask_indices = list_frame_indices(seg_dir, ".png")
-            if mask_indices:
+            seg_dirs = {}
+            common_mask_indices = None
+
+            for seg_part in seg_parts:
+                seg_path = annotations_dir / f"{name}{seg_part}_seg_{seg_dimension}.mp4"
+                if not seg_path.exists():
+                    return {
+                        "name": name,
+                        "rows": [],
+                        "frames_saved": saved,
+                        "labels_used": 0,
+                        "status": "missing_seg",
+                        "message": f"missing segmentation video ({seg_part})",
+                    }
+
+                seg_root = out_root / f"seg_{seg_part}_{seg_dimension}"
+                seg_dir = seg_root / vpath.stem
+                seg_dirs[seg_part] = seg_dir
+
+                extract_segmentation_ffmpeg(
+                    seg_path,
+                    seg_dir,
+                    size=(frame_width, frame_height),
+                    stride=frame_stride,
+                    binarize=seg_binarize,
+                    threshold=seg_threshold,
+                )
+
+                part_mask_indices = list_frame_indices(seg_dir, ".png")
+                if common_mask_indices is None:
+                    common_mask_indices = part_mask_indices
+                else:
+                    common_mask_indices &= part_mask_indices
+
+            if common_mask_indices:
                 before = len(df)
-                df = df[df["img_index"].isin(mask_indices)].copy()
+                df = df[df["img_index"].isin(common_mask_indices)].copy()
                 dropped = before - len(df)
                 if dropped:
                     print(
-                        f"    dropped {dropped} labels without masks for {vpath.stem}"
+                        f"    dropped {dropped} labels without complete masks for "
+                        f"{vpath.stem} ({','.join(seg_parts)})"
                     )
-                prune_unlabeled_frames(seg_dir, set(df["img_index"]), ".png")
+                keep_indices = set(df["img_index"])
+                for seg_dir in seg_dirs.values():
+                    prune_unlabeled_frames(seg_dir, keep_indices, ".png")
             else:
                 df = df.iloc[0:0].copy()
 
@@ -324,7 +376,7 @@ def process_split(
     frame_stride,
     jpeg_q,
     segmentation,
-    seg_part,
+    seg_parts,
     seg_dimension,
     seg_binarize,
     seg_threshold,
@@ -352,7 +404,7 @@ def process_split(
             frame_stride,
             jpeg_q,
             segmentation,
-            seg_part,
+            seg_parts,
             seg_dimension,
             seg_binarize,
             seg_threshold,
@@ -393,6 +445,7 @@ def main(args):
     annotations_dir = data_root / "ANNOTATIONS"
 
     output_parent = Path(args.output_root)
+    seg_parts = resolve_seg_parts(args.seg_parts)
     sample_suffix = ""
     if args.train_sample_frac < 1.0:
         train_pct = int(args.train_sample_frac * 100)
@@ -402,7 +455,7 @@ def main(args):
         sample_suffix += f"_val{val_pct:02d}"
     params_name = f"{args.frame_width}x{args.frame_height}_stride{args.frame_stride}_q{args.jpeg_q}{sample_suffix}"
     if args.segmentation:
-        params_name += f"_seg_{args.seg_part}_{args.seg_dimension}"
+        params_name += f"_seg_{'-'.join(seg_parts)}_{args.seg_dimension}"
     output_base = output_parent / params_name
     output_base.mkdir(parents=True, exist_ok=True)
     print(f"Saving preprocessed data to: {output_base}")
@@ -448,7 +501,7 @@ def main(args):
             frame_stride=args.frame_stride,
             jpeg_q=args.jpeg_q,
             segmentation=args.segmentation,
-            seg_part=args.seg_part,
+            seg_parts=seg_parts,
             seg_dimension=args.seg_dimension,
             seg_binarize=args.seg_binarize,
             seg_threshold=args.seg_threshold,
@@ -496,10 +549,13 @@ if __name__ == "__main__":
         help="Also extract segmentation masks aligned with the saved frames.",
     )
     parser.add_argument(
-        "--seg_part",
-        choices=["pupil", "iris", "lid"],
+        "--seg_parts",
+        type=str,
         default="pupil",
-        help="Which segmentation part to extract.",
+        help=(
+            "Comma-separated list of parts to extract in one run "
+            "(e.g., pupil,iris,lid) or 'all'. A single part (e.g., pupil) is valid."
+        ),
     )
     parser.add_argument(
         "--seg_dimension",
