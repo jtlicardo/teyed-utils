@@ -444,7 +444,12 @@ def plot_train_samples(
         center_y = height / 2.0
 
         ax.imshow(image)
-        for part in parts:
+        # Draw pupil last so it remains visible above iris/lid overlays.
+        overlay_parts = [part for part in parts if part != "pupil"]
+        if "pupil" in parts:
+            overlay_parts.append("pupil")
+
+        for part in overlay_parts:
             mask = masks_np[part][index, :, :, 0]
             mask_bin = (mask >= threshold).astype(np.float32)
             ax.imshow(
@@ -486,4 +491,3 @@ def plot_train_samples(
 
     plt.tight_layout()
     plt.show()
-
